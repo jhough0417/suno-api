@@ -525,8 +525,27 @@ class SunoApi {
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
     const createSessionToken = await this.getSessionToken().catch(() => null);
+
+    // Solve Cloudflare Turnstile if Suno requires it for this generation.
+    // The captcha-bypass code (getCaptcha → 2Captcha solver) was implemented
+    // but never wired into the generate payload — the token field was
+    // hardcoded null, which is exactly what makes Suno return HTTP 422
+    // "We couldn't verify your request". Calling getCaptcha here populates
+    // the token only if Suno actually demands one (otherwise it returns null
+    // quickly via /api/c/check), so this adds zero latency for unverified
+    // requests and ~5–15s when a Turnstile challenge is active.
+    let captchaToken: string | null = null;
+    try {
+      captchaToken = await this.getCaptcha();
+      if (captchaToken) {
+        logger.info('Captcha token attached to generate payload');
+      }
+    } catch (err) {
+      logger.error({ err }, 'getCaptcha failed, falling back to null token');
+    }
+
     const payload: any = {
-      token: null,
+      token: captchaToken,
       generation_type: 'TEXT',
       make_instrumental: make_instrumental,
       mv: model || DEFAULT_MODEL,
