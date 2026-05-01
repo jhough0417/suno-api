@@ -75,6 +75,16 @@ class SunoApi {
   private readonly client: AxiosInstance;
   private sid?: string;
   private currentToken?: string;
+  // Epoch-seconds at which `currentToken` expires. Used to skip unnecessary
+  // auth.suno.com refresh calls when the cached JWT is still valid.
+  private tokenExpiresAt?: number;
+  // In-flight refresh promise — avoids thundering-herd when many concurrent
+  // requests hit keepAlive() at the same moment that the JWT genuinely expires.
+  private refreshInflight?: Promise<void>;
+  // Safety floor: refresh when the JWT has less than this many seconds left.
+  // Suno's __session JWTs are ~60s long historically; we refresh ~10s before
+  // expiry so requests that take a few seconds in flight don't fail.
+  private static REFRESH_LEAD_SECONDS = 10;
   private deviceId?: string;
   private userAgent?: string;
   private cookies: Record<string, string | undefined>;
@@ -122,6 +132,25 @@ class SunoApi {
 
   public async init(): Promise<SunoApi> {
     //await this.getClerkLatestVersion();
+
+    // Fast path: if SUNO_COOKIE already contains a __session JWT that's still
+    // valid, prime our in-memory cache from it and skip the initial Clerk
+    // round-trip entirely. This eliminates the startup auth.suno.com burst
+    // that was hitting Clerk's per-account rate limit on container restarts.
+    const seededJwt = this.cookies.__session;
+    const seededExp = this.parseJwtExp(seededJwt);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (seededJwt && seededExp && seededExp - nowSec > SunoApi.REFRESH_LEAD_SECONDS) {
+      this.currentToken = seededJwt;
+      this.tokenExpiresAt = seededExp;
+      // We still need `sid` for the eventual refresh. Get it once now.
+      await this.getAuthToken();
+      logger.info(
+        `init: using __session from SUNO_COOKIE (exp in ${seededExp - nowSec}s); skipping initial keepAlive`
+      );
+      return this;
+    }
+
     await this.getAuthToken();
     await this.keepAlive();
     return this;
@@ -167,26 +196,76 @@ class SunoApi {
   }
 
   /**
-   * Keep the session alive.
-   * @param isWait Indicates if the method should wait for the session to be fully renewed before returning.
+   * Decode the `exp` claim from a JWT (epoch seconds). Returns undefined on
+   * any parse failure — callers must treat that as "unknown, refresh needed".
+   * Pure function: no network, no side effects.
    */
-  public async keepAlive(isWait?: boolean): Promise<void> {
+  private parseJwtExp(jwt?: string): number | undefined {
+    if (!jwt) return undefined;
+    const parts = jwt.split('.');
+    if (parts.length < 2) return undefined;
+    try {
+      const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = payloadB64 + '='.repeat((4 - (payloadB64.length % 4)) % 4);
+      const json = Buffer.from(padded, 'base64').toString('utf8');
+      const claims = JSON.parse(json);
+      return typeof claims.exp === 'number' ? claims.exp : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Keep the session alive.
+   *
+   * Behaviour change (v2): we cache `currentToken` and only call Clerk's
+   * `/v1/client/sessions/{sid}/tokens` endpoint when the cached JWT is within
+   * REFRESH_LEAD_SECONDS of its `exp` claim — or if no token is cached. This
+   * eliminates the per-request auth.suno.com hit that previously triggered
+   * Clerk rate-limiting under concurrent load. A simple in-flight promise
+   * prevents the thundering-herd refresh problem.
+   *
+   * @param isWait sleep briefly after refresh (legacy behaviour)
+   * @param force  bypass the cache (used by 401-recovery paths)
+   */
+  public async keepAlive(isWait?: boolean, force?: boolean): Promise<void> {
     if (!this.sid) {
       throw new Error('Session ID is not set. Cannot renew token.');
     }
-    // URL to renew session token
-    const renewUrl = `${SunoApi.CLERK_BASE_URL}/v1/client/sessions/${this.sid}/tokens?__clerk_api_version=2025-11-10&_clerk_js_version=${SunoApi.CLERK_VERSION}`;
-    // Renew session token
-    logger.info('KeepAlive...\n');
-    const renewResponse = await this.client.post(renewUrl, {}, {
-      headers: { Authorization: this.cookies.__client }
-    });
-    if (isWait) {
-      await sleep(1, 2);
+
+    if (!force && this.currentToken && this.tokenExpiresAt) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const remaining = this.tokenExpiresAt - nowSec;
+      if (remaining > SunoApi.REFRESH_LEAD_SECONDS) {
+        // Cached JWT is still good — no network call. This is the hot path.
+        return;
+      }
     }
-    const newToken = renewResponse.data.jwt;
-    // Update Authorization field in request header with the new JWT token
-    this.currentToken = newToken;
+
+    // De-dup concurrent refreshes: only one network call goes out at a time.
+    if (this.refreshInflight) {
+      await this.refreshInflight;
+      return;
+    }
+
+    const renewUrl = `${SunoApi.CLERK_BASE_URL}/v1/client/sessions/${this.sid}/tokens?__clerk_api_version=2025-11-10&_clerk_js_version=${SunoApi.CLERK_VERSION}`;
+    this.refreshInflight = (async () => {
+      try {
+        logger.info('KeepAlive: refreshing JWT (cache miss or expired)\n');
+        const renewResponse = await this.client.post(renewUrl, {}, {
+          headers: { Authorization: this.cookies.__client }
+        });
+        if (isWait) {
+          await sleep(1, 2);
+        }
+        const newToken = renewResponse.data.jwt;
+        this.currentToken = newToken;
+        this.tokenExpiresAt = this.parseJwtExp(newToken);
+      } finally {
+        this.refreshInflight = undefined;
+      }
+    })();
+    await this.refreshInflight;
   }
 
   /**
