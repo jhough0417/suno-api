@@ -1,12 +1,13 @@
 import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers'
-import { DEFAULT_MODEL, sunoApi } from "@/lib/SunoApi";
+import { DEFAULT_MODEL, sunoApi, releaseInstance } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   if (req.method === 'POST') {
+    let api: any = null;
     try {
       const body = await req.json();
       const { audio_id, prompt, continue_at, tags, negative_tags, title, model, wait_audio } = body;
@@ -21,8 +22,12 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const audioInfo = await (await sunoApi((await cookies()).toString()))
-        .extendAudio(audio_id, prompt, continue_at, tags || '', negative_tags || '', title, model || DEFAULT_MODEL, wait_audio || false);
+      api = await sunoApi((await cookies()).toString());
+      const audioInfo = await api.extendAudio(
+        audio_id, prompt, continue_at, tags || '', negative_tags || '', title, model || DEFAULT_MODEL, wait_audio || false
+      );
+
+      await releaseInstance(api, true);
 
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
@@ -32,6 +37,7 @@ export async function POST(req: NextRequest) {
         }
       });
     } catch (error: any) {
+      await releaseInstance(api, false, error?.response?.status);
       console.error('Error extend audio:', error);
       
       // Handle different types of errors

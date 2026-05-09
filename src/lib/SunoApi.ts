@@ -962,22 +962,128 @@ class SunoApi {
   }
 }
 
-export const sunoApi = async (cookie?: string) => {
-  const resolvedCookie = cookie && cookie.includes('__client') ? cookie : process.env.SUNO_COOKIE; // Check for bad `Cookie` header (It's too expensive to actually parse the cookies *here*)
-  if (!resolvedCookie) {
-    logger.info('No cookie provided! Aborting...\nPlease provide a cookie either in the .env file or in the Cookie header of your request.')
-    throw new Error('Please provide a cookie either in the .env file or in the Cookie header of your request.');
+// ──────────────────────────────────────────────────────────────────────────
+// Cookie source resolution: Pool → env-var fallback
+//
+// When LSQMUSIC_API_BASE is configured, sunoApi() with no caller-supplied
+// cookie will attempt to fetch one from the music app's admin API
+// (/api/admin/suno-accounts/pick). The pool returns an encrypted cookie
+// from the Supabase suno_accounts table — multiple accounts in rotation,
+// load-balanced by least-recently-used. Per-account JWT cache is preserved
+// by SunoApi's own instance cache (keyed on the cookie string).
+//
+// Architecture mirrors 谱乐 / YourMusic.fun (see PULE_WHAT_THEY_DID_RIGHT.md
+// sections 1+7).
+//
+// Fallback: if the pool endpoint is unreachable or unconfigured, falls back
+// to SUNO_COOKIE env var (the legacy single-account path) so the proxy never
+// hard-fails on admin-app downtime.
+//
+// Cookie precedence: explicit caller cookie  >  pool pick  >  env var
+// ──────────────────────────────────────────────────────────────────────────
+
+const POOL_BASE = process.env.LSQMUSIC_API_BASE
+  ? process.env.LSQMUSIC_API_BASE.replace(/\/$/, '')
+  : null;
+const POOL_PICK_URL = POOL_BASE ? `${POOL_BASE}/api/admin/suno-accounts/pick` : null;
+const POOL_KEY = process.env.SUNO_RECONNECT_KEY || 'lsq-music-studio';
+
+// Symbol so we don't collide with any field names on the SunoApi class.
+const POOL_ACCOUNT_ID = Symbol.for('sunoApi.poolAccountId');
+
+async function getOrCreateInstance(cookieString: string): Promise<SunoApi> {
+  const cached = cache.get(cookieString);
+  if (cached) return cached;
+  const instance = await new SunoApi(cookieString).init();
+  cache.set(cookieString, instance);
+  return instance;
+}
+
+async function pickFromPool(): Promise<{ cookieString: string; accountId: string } | null> {
+  if (!POOL_PICK_URL) return null;
+  try {
+    const r = await axios.get(POOL_PICK_URL, {
+      headers: { 'X-Vault-Token': POOL_KEY },
+      timeout: 5000,
+    });
+    const { accountId, accountLabel, cookieString } = r.data || {};
+    if (!cookieString || typeof cookieString !== 'string') {
+      logger.warn('Pool returned empty cookie');
+      return null;
+    }
+    logger.info('Pool picked account: %s', accountLabel || accountId);
+    return { cookieString, accountId: accountId || '' };
+  } catch (err: any) {
+    logger.warn('Pool pick failed (%s) — will try env var fallback', err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * Get a SunoApi instance.
+ *
+ * Resolution order:
+ *   1. If `cookie` is provided AND contains __client → use it directly.
+ *   2. Else, if pool is configured → pick an account from the pool.
+ *   3. Else, fall back to SUNO_COOKIE env var.
+ *
+ * The returned instance carries the pool account ID (when from the pool)
+ * so that callers can call `releaseInstance(api, success)` after their
+ * operation completes — that updates pool health counters.
+ */
+export const sunoApi = async (cookie?: string): Promise<SunoApi> => {
+  // Path 1: explicit caller cookie.
+  if (cookie && cookie.includes('__client')) {
+    return getOrCreateInstance(cookie);
   }
 
-  // Check if the instance for this cookie already exists in the cache
-  const cachedInstance = cache.get(resolvedCookie);
-  if (cachedInstance)
-    return cachedInstance;
+  // Path 2: pool pick.
+  const picked = await pickFromPool();
+  if (picked) {
+    const instance = await getOrCreateInstance(picked.cookieString);
+    (instance as any)[POOL_ACCOUNT_ID] = picked.accountId;
+    return instance;
+  }
 
-  // If not, create a new instance and initialize it
-  const instance = await new SunoApi(resolvedCookie).init();
-  // Cache the initialized instance
-  cache.set(resolvedCookie, instance);
+  // Path 3: env var fallback.
+  if (!process.env.SUNO_COOKIE) {
+    logger.error(
+      'No Suno cookie source available (caller cookie, pool, env var all empty/unconfigured).'
+    );
+    throw new Error(
+      'Please configure either SUNO_COOKIE env var or LSQMUSIC_API_BASE pool URL.'
+    );
+  }
+  return getOrCreateInstance(process.env.SUNO_COOKIE);
+};
 
-  return instance;
+/**
+ * After a generation succeeds or fails, call this with the SunoApi instance
+ * to inform the pool. Updates per-account success/failure counters; no-op
+ * for instances that came from the env-var fallback path. Best-effort —
+ * never throws, never blocks the response.
+ */
+export const releaseInstance = async (
+  api: SunoApi | null,
+  success: boolean,
+  errorCode?: string | number
+): Promise<void> => {
+  if (!api || !POOL_PICK_URL) return;
+  const accountId = (api as any)[POOL_ACCOUNT_ID];
+  if (!accountId) return; // env-var fallback path; nothing to release.
+  try {
+    await axios.post(
+      POOL_PICK_URL,
+      { accountId, success, errorCode: errorCode != null ? String(errorCode) : undefined },
+      {
+        headers: {
+          'X-Vault-Token': POOL_KEY,
+          'Content-Type': 'application/json',
+        },
+        timeout: 3000,
+      }
+    );
+  } catch (err: any) {
+    logger.warn('Pool release failed for account %s: %s', accountId, err?.message || err);
+  }
 };
