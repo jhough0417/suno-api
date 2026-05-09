@@ -380,19 +380,135 @@ class SunoApi {
   }
 
   /**
-   * Checks for CAPTCHA verification and solves the CAPTCHA if needed
-   * @returns {string|null} hCaptcha token. If no verification is required, returns null
+   * Solve Cloudflare Turnstile via CapSolver.
+   *
+   * Why CapSolver over 2Captcha:
+   *   - 谱乐 / YourMusic.fun (the reference Suno-aggregator) operates with
+   *     ~17s end-to-end Suno generation latency. 2Captcha's typical solve
+   *     time of 10-30s eats most of that budget and frequently produces
+   *     tokens that are stale by the time Suno checks them, surfacing as
+   *     HTTP 422 "We couldn't verify your request".
+   *   - CapSolver typically solves Cloudflare Turnstile in 2-5 seconds at
+   *     the same per-solve price (~$0.0008 / ~¥0.005). The faster solve
+   *     dramatically reduces token-staleness rejections.
+   *   - Drop-in API: CreateTask + getTaskResult, no SDK needed.
+   *
+   * Falls back to returning null on solver failure — the calling generate
+   * payload will go out with `token: null` and Suno will reject only if it
+   * actually requires a token in this moment (the captchaRequired() probe
+   * usually catches the "not required" case earlier).
+   */
+  private static CAPSOLVER_BASE = 'https://api.capsolver.com';
+  private static CAPSOLVER_POLL_INTERVAL_MS = 1500;
+  private static CAPSOLVER_TIMEOUT_MS = 30000;
+
+  private async solveTurnstileViaCapSolver(): Promise<string|null> {
+    const apiKey = process.env.CAPSOLVER_KEY;
+    if (!apiKey) {
+      logger.warn('CAPSOLVER_KEY not set; cannot solve Turnstile');
+      return null;
+    }
+    try {
+      // 1. Create the task.
+      const createResp = await this.client.post(
+        `${SunoApi.CAPSOLVER_BASE}/createTask`,
+        {
+          clientKey: apiKey,
+          task: {
+            type: 'AntiTurnstileTaskProxyLess',
+            websiteURL: 'https://suno.com/create',
+            websiteKey: '0x4AAAAAABtnpJo7aKMs9JLQ',
+          },
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 8000,
+          // Don't send our Suno cookies / headers to CapSolver.
+          transformRequest: [(data) => JSON.stringify(data)],
+        }
+      );
+      if (createResp.data?.errorId !== 0 || !createResp.data?.taskId) {
+        logger.warn(
+          'CapSolver createTask error: %s (%s)',
+          createResp.data?.errorCode,
+          createResp.data?.errorDescription
+        );
+        return null;
+      }
+      const taskId = createResp.data.taskId as string;
+
+      // 2. Poll until solved or timeout.
+      const start = Date.now();
+      while (Date.now() - start < SunoApi.CAPSOLVER_TIMEOUT_MS) {
+        await sleep(
+          SunoApi.CAPSOLVER_POLL_INTERVAL_MS / 1000,
+          SunoApi.CAPSOLVER_POLL_INTERVAL_MS / 1000
+        );
+        const pollResp = await this.client.post(
+          `${SunoApi.CAPSOLVER_BASE}/getTaskResult`,
+          { clientKey: apiKey, taskId },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 8000 }
+        );
+        if (pollResp.data?.errorId !== 0) {
+          logger.warn('CapSolver getTaskResult error: %s', pollResp.data?.errorCode);
+          return null;
+        }
+        if (pollResp.data?.status === 'ready') {
+          const token = pollResp.data?.solution?.token as string | undefined;
+          if (token) {
+            logger.info('Turnstile token obtained via CapSolver in %dms', Date.now() - start);
+            return token;
+          }
+          logger.warn('CapSolver returned ready but no token field');
+          return null;
+        }
+        // status === 'processing' — keep polling
+      }
+      logger.warn('CapSolver poll timeout after %dms', SunoApi.CAPSOLVER_TIMEOUT_MS);
+      return null;
+    } catch (err: any) {
+      logger.warn('CapSolver request failed: %s', err?.message || String(err));
+      return null;
+    }
+  }
+
+  /**
+   * Checks for CAPTCHA verification and solves the CAPTCHA if needed.
+   *
+   * Order of preference for solver:
+   *   1. CapSolver  (faster, configured via CAPSOLVER_KEY)
+   *   2. 2Captcha   (legacy fallback, configured via TWOCAPTCHA_KEY)
+   *
+   * @returns {string|null} Turnstile token, or null if no verification required.
    */
   public async getCaptcha(): Promise<string|null> {
     if (!await this.captchaRequired())
       return null;
-    logger.info('Solving Cloudflare Turnstile via 2Captcha...');
-    const result = await this.solver.cloudflareTurnstile({
-      pageurl: 'https://suno.com/create',
-      sitekey: '0x4AAAAAABtnpJo7aKMs9JLQ',
-    });
-    logger.info('Turnstile token obtained');
-    return result.data;
+
+    // Try CapSolver first.
+    if (process.env.CAPSOLVER_KEY) {
+      const token = await this.solveTurnstileViaCapSolver();
+      if (token) return token;
+      logger.warn('CapSolver returned no token; falling back to 2Captcha if available');
+    }
+
+    // Fallback to 2Captcha (existing path).
+    if (process.env.TWOCAPTCHA_KEY) {
+      logger.info('Solving Cloudflare Turnstile via 2Captcha (fallback)...');
+      try {
+        const result = await this.solver.cloudflareTurnstile({
+          pageurl: 'https://suno.com/create',
+          sitekey: '0x4AAAAAABtnpJo7aKMs9JLQ',
+        });
+        logger.info('Turnstile token obtained via 2Captcha');
+        return result.data;
+      } catch (err: any) {
+        logger.warn('2Captcha solve failed: %s', err?.message || String(err));
+      }
+    }
+
+    logger.warn('No captcha solver succeeded; submitting with token: null');
+    return null;
   }
   /**
    * Imitates Cloudflare Turnstile loading error. Unused right now, left for future
