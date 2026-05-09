@@ -426,11 +426,12 @@ export async function onboardAccount(opts: {
 
     // ── Step 5: Type the password ──────────────────────────────────────
     try {
-      await oauthPage.waitForSelector('input[type="password"][name="Passwd"], input[type="password"]', {
-        timeout: 10_000,
+      await oauthPage.waitForSelector('input[autocomplete="current-password"]:not([aria-hidden="true"]), input[type="password"]:not([aria-hidden="true"]):not([name="hiddenPassword"])', {
+        timeout: 15_000,
+        state: "visible",
       });
       await oauthPage.fill(
-        'input[type="password"][name="Passwd"], input[type="password"]',
+        'input[autocomplete="current-password"]:not([aria-hidden="true"]), input[type="password"]:not([aria-hidden="true"]):not([name="hiddenPassword"])',
         opts.password
       );
       await oauthPage.click('#passwordNext button, button:has-text("Next")', { timeout: 5000 });
