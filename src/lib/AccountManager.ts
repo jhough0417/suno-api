@@ -61,7 +61,16 @@ const CHROMIUM_LAUNCH_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
+  // Suppress the 'Chrome is being controlled by automated test software' banner
+  // and AutomationControlled hint that Google's bot detection scrapes.
   '--disable-blink-features=AutomationControlled',
+  '--no-first-run',
+  '--no-default-browser-check',
+  // Window size matters: many sites refuse non-standard sizes.
+  '--window-size=1280,800',
+  // User-Agent override to look like a normal Chrome (headless mode appends
+  // 'HeadlessChrome' to the UA string).
+  '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
 ];
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -388,25 +397,43 @@ export async function onboardAccount(opts: {
     }
 
     // Wait for whichever fires first: popup, main-frame navigation to
-    // accounts.google.com, or timeout.
+    // accounts.google.com, or timeout. The popup typically opens to
+    // about:blank first, then navigates to Google async — so we ALSO
+    // need to wait for the popup itself to reach accounts.google.com.
     const newPage = await Promise.race([popupPromise, navPromise]);
     let oauthPage: Page = page;
     if (newPage && newPage !== page) {
       oauthPage = newPage as Page;
-      await oauthPage.waitForLoadState('domcontentloaded').catch(() => null);
+      // Wait for the popup to navigate to accounts.google.com (it usually
+      // opens as about:blank first, then Suno's JS sets the location).
+      try {
+        await oauthPage.waitForURL(/accounts\.google\.com/, { timeout: 15_000 });
+        await oauthPage.waitForLoadState('domcontentloaded').catch(() => null);
+      } catch {
+        // Popup never navigated. Capture its state for debugging.
+        const popupUrl = oauthPage.url();
+        const popupTitle = await oauthPage.title().catch(() => '');
+        logger.error(
+          { popupUrl, popupTitle, mainUrl: page.url() },
+          'onboardAccount: popup opened but never navigated to Google'
+        );
+        return {
+          status: 'unknown_error',
+          error: `Popup opened but did not navigate to accounts.google.com within 15s. Stuck at: ${popupUrl} (title="${popupTitle}"). This usually means Chromium's headless mode is being detected by Suno or Google.`,
+          screenshot: await captureScreenshot(),
+          currentUrl: popupUrl,
+          durationMs: Date.now() - start,
+        };
+      }
     } else if (newPage === page) {
-      // main-frame navigated; already on accounts.google.com
       oauthPage = page;
     } else {
-      // Neither event fired — fall back to scanning context pages.
       await page.waitForTimeout(2500);
       const allPages = context.pages();
       const googlePage = allPages.find((p) => p.url().includes('accounts.google.com'));
       if (googlePage) {
         oauthPage = googlePage;
       } else {
-        // No Google page found at all. Capture screenshots of ALL pages
-        // so we can debug what Suno did with the click.
         const urls = allPages.map((p) => p.url());
         logger.error({ urls, pageCount: allPages.length }, 'onboardAccount: Google OAuth never opened after click');
         return {
