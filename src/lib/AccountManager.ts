@@ -84,6 +84,7 @@ export interface OnboardResult {
   jwtExpiresAt?: number;            // epoch seconds
   error?: string;                   // human-readable error detail
   screenshot?: string;              // data URL, present for 'needs_human_verification'
+  currentUrl?: string;             // debug: page URL when failure occurred
   durationMs: number;
 }
 
@@ -92,6 +93,7 @@ export interface RefreshResult {
   cookieString?: string;
   jwtExpiresAt?: number;
   error?: string;
+  currentUrl?: string;             // debug: page URL when failure occurred
   durationMs: number;
 }
 
@@ -397,11 +399,21 @@ export async function onboardAccount(opts: {
         timeout: 5000,
       });
     } catch (err: any) {
-      logger.error({ err: err?.message }, 'onboardAccount: email step failed');
+      const currentUrl = oauthPage.url();
+      const pageTitle = await oauthPage.title().catch(() => '');
+      logger.error(
+        { err: err?.message, currentUrl, pageTitle },
+        'onboardAccount: email step failed'
+      );
+      // Check if Google showed a challenge instead of email input.
+      const ch = await detectGoogleChallenge(oauthPage).catch(() => null);
       return {
-        status: 'unknown_error',
-        error: 'Could not fill Google email field: ' + (err?.message || ''),
+        status: ch ? 'needs_human_verification' : 'unknown_error',
+        error: ch
+          ? `Google challenge at email step: ${ch} (url=${currentUrl})`
+          : `Could not fill Google email field at ${currentUrl} (title="${pageTitle}"): ${err?.message || ''}`,
         screenshot: await captureScreenshot(),
+        currentUrl,
         durationMs: Date.now() - start,
       };
     }
