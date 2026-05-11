@@ -306,6 +306,27 @@ export async function onboardAccount(opts: {
       viewport: { width: 1280, height: 800 },
       timeout: ONBOARD_TIMEOUT_MS,
     });
+
+    // CRITICAL: Suno opens Google OAuth via window.open(url, '_blank',
+    // 'noopener'). With 'noopener', Playwright's context.waitForEvent('page')
+    // and page.on('popup') don't fire reliably in headless mode — we saw the
+    // popup land at about:blank and never navigate to Google.
+    //
+    // Workaround: intercept window.open in every page and turn it into a
+    // same-frame navigation. OAuth then runs in the main page where
+    // Playwright can interact with it normally.
+    await context.addInitScript(() => {
+      const realOpen = window.open.bind(window);
+      // @ts-ignore - deliberately divergent return type
+      window.open = function (url, target, features) {
+        if (url) {
+          window.location.href = String(url);
+          return window;
+        }
+        return realOpen(url, target, features);
+      };
+    });
+
     page = await context.newPage();
 
     // ── Step 1: navigate to Suno's sign-in page ─────────────────────────
