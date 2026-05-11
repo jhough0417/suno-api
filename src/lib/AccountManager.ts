@@ -61,16 +61,9 @@ const CHROMIUM_LAUNCH_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
-  // Suppress the 'Chrome is being controlled by automated test software' banner
-  // and AutomationControlled hint that Google's bot detection scrapes.
   '--disable-blink-features=AutomationControlled',
   '--no-first-run',
   '--no-default-browser-check',
-  // Window size matters: many sites refuse non-standard sizes.
-  '--window-size=1280,800',
-  // User-Agent override to look like a normal Chrome (headless mode appends
-  // 'HeadlessChrome' to the UA string).
-  '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
 ];
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -316,15 +309,20 @@ export async function onboardAccount(opts: {
     // same-frame navigation. OAuth then runs in the main page where
     // Playwright can interact with it normally.
     await context.addInitScript(() => {
-      const realOpen = window.open.bind(window);
-      // @ts-ignore - deliberately divergent return type
-      window.open = function (url, target, features) {
-        if (url) {
-          window.location.href = String(url);
-          return window;
-        }
-        return realOpen(url, target, features);
-      };
+      try {
+        const originalOpen = window.open;
+        // @ts-ignore - intentional override
+        window.open = function (url: any, target: any, features: any) {
+          if (url) {
+            try { window.location.href = String(url); } catch (e) { /* noop */ }
+            return null;
+          }
+          return originalOpen.call(window, url, target, features);
+        };
+      } catch (e) {
+        // If override fails, fall through — popup-based OAuth will fail but
+        // the rest of the flow can still run.
+      }
     });
 
     page = await context.newPage();
