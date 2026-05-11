@@ -357,11 +357,20 @@ export async function onboardAccount(opts: {
       'button:has-text("Google")',
       '[data-provider="google"]',
     ];
+    // Set up listeners BEFORE the click so we catch popups that open async.
+    // Suno uses Clerk which may navigate the main frame, open a popup, or
+    // open a new tab. We race all three outcomes.
+    const popupPromise = context.waitForEvent('page', { timeout: 15_000 }).catch(() => null);
+    const navPromise = page.waitForURL(/accounts\.google\.com/, { timeout: 15_000 })
+      .then(() => page)
+      .catch(() => null);
+
     let clickedGoogle = false;
     for (const sel of googleBtnSelectors) {
       try {
         await page.click(sel, { timeout: 6000 });
         clickedGoogle = true;
+        logger.info({ sel }, 'onboardAccount: clicked Google button');
         break;
       } catch {
         // try next
@@ -373,19 +382,41 @@ export async function onboardAccount(opts: {
         status: 'unknown_error',
         error: 'Could not find Google sign-in button on Suno page.',
         screenshot: await captureScreenshot(),
+        currentUrl: page.url(),
         durationMs: Date.now() - start,
       };
     }
 
-    // Wait for the Google OAuth popup or redirect.
-    await page.waitForTimeout(2500);
-
-    // Google may have opened a popup or redirected the main frame; handle both.
+    // Wait for whichever fires first: popup, main-frame navigation to
+    // accounts.google.com, or timeout.
+    const newPage = await Promise.race([popupPromise, navPromise]);
     let oauthPage: Page = page;
-    const pages = context.pages();
-    const googlePage = pages.find((p) => p.url().includes('accounts.google.com'));
-    if (googlePage && googlePage !== page) {
-      oauthPage = googlePage;
+    if (newPage && newPage !== page) {
+      oauthPage = newPage as Page;
+      await oauthPage.waitForLoadState('domcontentloaded').catch(() => null);
+    } else if (newPage === page) {
+      // main-frame navigated; already on accounts.google.com
+      oauthPage = page;
+    } else {
+      // Neither event fired — fall back to scanning context pages.
+      await page.waitForTimeout(2500);
+      const allPages = context.pages();
+      const googlePage = allPages.find((p) => p.url().includes('accounts.google.com'));
+      if (googlePage) {
+        oauthPage = googlePage;
+      } else {
+        // No Google page found at all. Capture screenshots of ALL pages
+        // so we can debug what Suno did with the click.
+        const urls = allPages.map((p) => p.url());
+        logger.error({ urls, pageCount: allPages.length }, 'onboardAccount: Google OAuth never opened after click');
+        return {
+          status: 'unknown_error',
+          error: `Google OAuth flow did not open after click. Pages in context: ${JSON.stringify(urls)}`,
+          screenshot: await captureScreenshot(),
+          currentUrl: page.url(),
+          durationMs: Date.now() - start,
+        };
+      }
     }
 
     // ── Step 3: Type the email ──────────────────────────────────────────
